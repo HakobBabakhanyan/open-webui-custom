@@ -1348,6 +1348,80 @@ export const getUsage = async (token: string = '') => {
 	return res;
 };
 
+export const getAdminUsageSummary = async (token: string = '', params: { start_ts?: number; end_ts?: number } = {}) => {
+	let error = null;
+	const query = new URLSearchParams(
+		Object.entries(params)
+			.filter(([, v]) => v !== undefined && v !== null)
+			.map(([k, v]) => [k, String(v)])
+	);
+
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/admin/usage/summary?${query.toString()}`, {
+		method: 'GET',
+		headers: {
+			'Content-Type': 'application/json',
+			...(token && { Authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			error = err;
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const getAdminUsageLogs = async (
+	token: string = '',
+	params: {
+		user_id?: string;
+		provider?: string;
+		start_ts?: number;
+		end_ts?: number;
+		skip?: number;
+		limit?: number;
+	} = {}
+) => {
+	let error = null;
+	const query = new URLSearchParams(
+		Object.entries(params)
+			.filter(([, v]) => v !== undefined && v !== null)
+			.map(([k, v]) => [k, String(v)])
+	);
+
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/admin/usage/logs?${query.toString()}`, {
+		method: 'GET',
+		headers: {
+			'Content-Type': 'application/json',
+			...(token && { Authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			error = err;
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
 export const getBackendConfig = async () => {
 	let error = null;
 

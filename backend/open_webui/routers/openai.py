@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 from typing import Optional
+from uuid import uuid4
 
 import aiohttp
 from aiocache import cached
@@ -33,6 +34,7 @@ from open_webui.env import (
     BYPASS_MODEL_ACCESS_CONTROL,
 )
 from open_webui.models.users import UserModel
+from open_webui.models.usage import Usages
 
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import SRC_LOG_LEVELS
@@ -938,8 +940,58 @@ async def generate_chat_completion(
         # Check if response is SSE
         if "text/event-stream" in r.headers.get("Content-Type", ""):
             streaming = True
+
+            usage_id = f"usage_{uuid4()}"
+            provider = "openai"
+            endpoint = "chat.completions"
+            model_name = form_data.get("model")
+
+            async def relay_and_log_usage():
+                usage_recorded = False
+                async for chunk in stream_chunks_handler(r.content):
+                    # Attempt to parse usage from SSE lines: "data: { ... }"
+                    try:
+                        if chunk.startswith(b"data:"):
+                            payload = chunk[5:].strip()
+                            if payload and payload != b"[DONE]":
+                                obj = json.loads(payload.decode("utf-8"))
+                                usage = obj.get("usage")
+                                if isinstance(usage, dict) and not usage_recorded:
+                                    # Persist usage once when we see it
+                                    Usages.add_usage(
+                                        id=usage_id,
+                                        user_id=user.id,
+                                        provider=provider,
+                                        model=model_name,
+                                        endpoint=endpoint,
+                                        request_id=obj.get("id")
+                                        if isinstance(obj.get("id"), str)
+                                        else None,
+                                        usage=usage,
+                                        extra={"stream": True},
+                                    )
+                                    usage_recorded = True
+                    except Exception:
+                        # Ignore parsing errors; just forward the chunk
+                        pass
+
+                    yield chunk
+
+                # If stream finished without usage info, persist at least a request record
+                if not usage_recorded:
+                    Usages.add_usage(
+                        id=usage_id,
+                        user_id=user.id,
+                        provider=provider,
+                        model=model_name,
+                        endpoint=endpoint,
+                        request_id=None,
+                        usage=None,
+                        extra={"stream": True, "note": "no usage in stream"},
+                    )
+
             return StreamingResponse(
-                stream_chunks_handler(r.content),
+                relay_and_log_usage(),
                 status_code=r.status,
                 headers=dict(r.headers),
                 background=BackgroundTask(
@@ -958,6 +1010,25 @@ async def generate_chat_completion(
                     return JSONResponse(status_code=r.status, content=response)
                 else:
                     return PlainTextResponse(status_code=r.status, content=response)
+
+            # Log usage for non-streaming responses (if available)
+            try:
+                if isinstance(response, dict):
+                    usage = response.get("usage")
+                    Usages.add_usage(
+                        id=f"usage_{uuid4()}",
+                        user_id=user.id,
+                        provider="openai",
+                        model=form_data.get("model"),
+                        endpoint="chat.completions",
+                        request_id=response.get("id")
+                        if isinstance(response.get("id"), str)
+                        else None,
+                        usage=usage if isinstance(usage, dict) else None,
+                        extra={"stream": False},
+                    )
+            except Exception:
+                pass
 
             return response
     except Exception as e:
@@ -1041,6 +1112,25 @@ async def embeddings(request: Request, form_data: dict, user):
                     return PlainTextResponse(
                         status_code=r.status, content=response_data
                     )
+
+            # Log usage for embeddings if usage is included
+            try:
+                if isinstance(response_data, dict):
+                    usage = response_data.get("usage")
+                    Usages.add_usage(
+                        id=f"usage_{uuid4()}",
+                        user_id=user.id,
+                        provider="openai",
+                        model=form_data.get("model"),
+                        endpoint="embeddings",
+                        request_id=response_data.get("id")
+                        if isinstance(response_data.get("id"), str)
+                        else None,
+                        usage=usage if isinstance(usage, dict) else None,
+                        extra={"stream": False},
+                    )
+            except Exception:
+                pass
 
             return response_data
     except Exception as e:
