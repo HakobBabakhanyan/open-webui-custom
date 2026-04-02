@@ -1859,7 +1859,7 @@ async def chat_image_generation_handler(
 
             system_message_content = "<context>The requested image has been created by the system successfully and is now being shown to the user. Let the user know that the image they requested has been generated and is now shown in the chat.</context>"
         except Exception as e:
-            log.debug(e)
+            log.exception(f"Image generation failed: {e}")
 
             error_message = ""
             if isinstance(e, HTTPException):
@@ -1867,6 +1867,8 @@ async def chat_image_generation_handler(
                     error_message = e.detail.get("message", str(e.detail))
                 else:
                     error_message = str(e.detail)
+            else:
+                error_message = str(e)
 
             await __event_emitter__(
                 {
