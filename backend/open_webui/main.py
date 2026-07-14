@@ -623,9 +623,6 @@ from open_webui.config import (
     QUERY_GENERATION_PROMPT_TEMPLATE,
     AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE,
     AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH,
-    AppConfig,
-    reset_config,
-    async_reset_config,
 )
 from open_webui.env import (
     ENABLE_CUSTOM_MODEL_FALLBACK,
