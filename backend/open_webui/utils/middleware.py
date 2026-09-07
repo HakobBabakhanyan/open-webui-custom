@@ -3036,6 +3036,16 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 ]
                 if inlet_filter_tools:
                     form_data['tools'].extend(inlet_filter_tools)
+
+                # Deduplicate tools by function name to prevent model API errors
+                seen_tool_names = set()
+                deduped_tools = []
+                for tool_item in form_data['tools']:
+                    tool_name = tool_item.get('function', {}).get('name')
+                    if tool_name not in seen_tool_names:
+                        seen_tool_names.add(tool_name)
+                        deduped_tools.append(tool_item)
+                form_data['tools'] = deduped_tools
             else:
                 # If the function calling is not native, then call the tools function calling handler
                 try:
