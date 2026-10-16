@@ -1,216 +1,297 @@
 import time
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import (
-    BigInteger,
-    JSON,
-    Column,
-    Text,
-    String,
-    func,
-    and_,
-)
+from sqlalchemy import BigInteger, Column, String, inspect, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from open_webui.internal.db import Base, get_db
 from open_webui.models.users import User
 
 
-class Usage(Base):
-    __tablename__ = "usage_log"
+# USD per 1,000,000 tokens: (input, output). Longer names are matched first.
+# Unknown models still count tokens, but their spend stays unpriced.
+_MODEL_RATES: dict[str, tuple[float, float]] = {
+    'gpt-4.1-nano': (0.10, 0.40),
+    'gpt-4.1-mini': (0.40, 1.60),
+    'gpt-4.1': (2.00, 8.00),
+    'gpt-4o-mini': (0.15, 0.60),
+    'gpt-4o': (2.50, 10.00),
+    'gpt-4-turbo': (10.00, 30.00),
+    'gpt-3.5-turbo': (0.50, 1.50),
+    'o4-mini': (1.10, 4.40),
+    'o3-mini': (1.10, 4.40),
+    'o3': (2.00, 8.00),
+    'o1-mini': (1.10, 4.40),
+    'o1': (15.00, 60.00),
+    'text-embedding-3-small': (0.02, 0.0),
+    'text-embedding-3-large': (0.13, 0.0),
+    'text-embedding-ada-002': (0.10, 0.0),
+    'claude-opus-4-1': (15.00, 75.00),
+    'claude-opus-4': (15.00, 75.00),
+    'claude-sonnet-4-5': (3.00, 15.00),
+    'claude-sonnet-4': (3.00, 15.00),
+    'claude-haiku-4-5': (1.00, 5.00),
+    'claude-3-7-sonnet': (3.00, 15.00),
+    'claude-3-5-sonnet': (3.00, 15.00),
+    'claude-3-5-haiku': (0.80, 4.00),
+    'claude-3-opus': (15.00, 75.00),
+    'claude-3-haiku': (0.25, 1.25),
+    'claude-3-sonnet': (3.00, 15.00),
+    'gemini-2.5-flash-lite': (0.10, 0.40),
+    'gemini-2.5-flash': (0.30, 2.50),
+    'gemini-2.5-pro': (1.25, 10.00),
+    'gemini-2.0-flash-lite': (0.075, 0.30),
+    'gemini-2.0-flash': (0.10, 0.40),
+    'gemini-1.5-flash-8b': (0.0375, 0.15),
+    'gemini-1.5-flash': (0.075, 0.30),
+    'gemini-1.5-pro': (1.25, 5.00),
+}
+_RATE_KEYS = sorted(_MODEL_RATES, key=len, reverse=True)
 
-    id = Column(Text, primary_key=True, unique=True)
-    user_id = Column(Text, nullable=False)
 
-    provider = Column(String, nullable=False)  # e.g., "openai"
-    model = Column(String, nullable=True)
-    endpoint = Column(String, nullable=True)  # e.g., "chat.completions", "embeddings"
-    request_id = Column(Text, nullable=True)
+class UserTokenUsage(Base):
+    __tablename__ = 'user_token_usage'
 
-    # Raw OpenAI-compatible usage object for extensibility
-    usage = Column(JSON, nullable=True)
-
-    # Denormalized common counters for easy aggregation
-    prompt_tokens = Column(BigInteger, nullable=True)
-    completion_tokens = Column(BigInteger, nullable=True)
-    total_tokens = Column(BigInteger, nullable=True)
-
-    # Optional metadata (e.g., tenant, ip, extra context)
-    extra = Column(JSON, nullable=True)
-
-    created_at = Column(BigInteger, nullable=False)
+    user_id = Column(String, primary_key=True)
+    request_count = Column(BigInteger, nullable=False, default=0)
+    prompt_tokens = Column(BigInteger, nullable=False, default=0)
+    completion_tokens = Column(BigInteger, nullable=False, default=0)
+    total_tokens = Column(BigInteger, nullable=False, default=0)
+    cost_micros = Column(BigInteger, nullable=False, default=0)
+    unpriced_tokens = Column(BigInteger, nullable=False, default=0)
+    updated_at = Column(BigInteger, nullable=False)
 
 
-class UsageModel(BaseModel):
-    id: str
+class UserTokenTotal(BaseModel):
     user_id: str
-    provider: str
-    model: Optional[str] = None
-    endpoint: Optional[str] = None
-    request_id: Optional[str] = None
-
-    usage: Optional[dict] = None
-    prompt_tokens: Optional[int] = None
-    completion_tokens: Optional[int] = None
-    total_tokens: Optional[int] = None
-
-    extra: Optional[dict] = None
-
-    created_at: int
+    user_email: Optional[str] = None
+    user_name: Optional[str] = None
+    request_count: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cost_micros: int
+    unpriced_tokens: int
+    updated_at: int
 
     model_config = ConfigDict(from_attributes=True)
 
 
-class UsageSummaryByUser(BaseModel):
-    user_id: str
-    user_email: Optional[str] = None
-    request_count: int
-    total_tokens: int
+def _int_or_zero(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
-def _extract_usage_counters(usage: Optional[Dict[str, Any]]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+def _token_counts(usage: Optional[dict]) -> Optional[tuple[int, int, int]]:
     if not isinstance(usage, dict):
-        return None, None, None
-    prompt_tokens = usage.get("prompt_tokens")
-    completion_tokens = usage.get("completion_tokens")
-    total_tokens = usage.get("total_tokens")
-    return prompt_tokens, completion_tokens, total_tokens
+        return None
+
+    prompt = usage.get('prompt_tokens')
+    if prompt is None:
+        prompt = usage.get('input_tokens')
+    completion = usage.get('completion_tokens')
+    if completion is None:
+        completion = usage.get('output_tokens')
+
+    prompt = _int_or_zero(prompt)
+    completion = _int_or_zero(completion)
+    total = usage.get('total_tokens')
+    total = _int_or_zero(total) if total is not None else prompt + completion
+    if prompt == 0 and completion == 0 and total == 0:
+        return None
+    if total < prompt + completion:
+        total = prompt + completion
+    return prompt, completion, total
 
 
-class UsagesTable:
+def _model_key(model: Optional[str]) -> str:
+    name = (model or '').strip().lower()
+    if '/' in name:
+        name = name.rsplit('/', 1)[-1]
+    if name.startswith('ft:'):
+        parts = name.split(':')
+        if len(parts) >= 2:
+            name = parts[1]
+    return name
+
+
+def estimate_cost_micros(model: Optional[str], prompt_tokens: int, completion_tokens: int) -> tuple[int, int]:
+    """Return (cost in micro-USD, tokens that had no price)."""
+    name = _model_key(model)
+    for key in _RATE_KEYS:
+        if name == key or name.startswith(f'{key}-'):
+            input_rate, output_rate = _MODEL_RATES[key]
+            cost = int(round(prompt_tokens * input_rate + completion_tokens * output_rate))
+            return cost, 0
+    return 0, prompt_tokens + completion_tokens
+
+
+class UserTokenUsages:
+    def __init__(self):
+        self._ready = False
+
     def ensure_table(self):
+        if self._ready:
+            return
         with get_db() as db:
-            # Create the table if it does not exist
-            Usage.__table__.create(bind=db.bind, checkfirst=True)
+            UserTokenUsage.__table__.create(bind=db.bind, checkfirst=True)
+            if db.query(UserTokenUsage.user_id).first() is None:
+                self._rollup_legacy_logs(db)
+                db.commit()
+        self._ready = True
 
-    def add_usage(
-        self,
-        *,
-        id: str,
-        user_id: str,
-        provider: str,
-        model: Optional[str],
-        endpoint: Optional[str],
-        request_id: Optional[str],
-        usage: Optional[dict],
-        extra: Optional[dict] = None,
-        created_at: Optional[int] = None,
-    ) -> Optional[UsageModel]:
-        self.ensure_table()
+    def _rollup_legacy_logs(self, db):
+        if not inspect(db.bind).has_table('usage_log'):
+            return
 
-        created_at = created_at or int(time.time())
-        prompt_tokens, completion_tokens, total_tokens = _extract_usage_counters(usage)
-
-        with get_db() as db:
-            row = Usage(
-                id=id,
-                user_id=user_id,
-                provider=provider,
-                model=model,
-                endpoint=endpoint,
-                request_id=request_id,
-                usage=usage,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
-                extra=extra,
-                created_at=created_at,
+        rows = db.execute(
+            text(
+                """
+                SELECT user_id,
+                       model,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                       MAX(created_at) AS updated_at
+                FROM usage_log
+                WHERE prompt_tokens IS NOT NULL
+                   OR completion_tokens IS NOT NULL
+                   OR total_tokens IS NOT NULL
+                GROUP BY user_id, model
+                """
             )
-            db.add(row)
+        ).mappings()
+
+        folded: dict[str, dict] = {}
+        for row in rows:
+            user_id = row['user_id']
+            if not user_id:
+                continue
+            prompt = _int_or_zero(row['prompt_tokens'])
+            completion = _int_or_zero(row['completion_tokens'])
+            total = _int_or_zero(row['total_tokens']) or (prompt + completion)
+            if prompt == 0 and completion == 0 and total == 0:
+                continue
+            cost, unpriced = estimate_cost_micros(row['model'], prompt, completion)
+            current = folded.setdefault(
+                user_id,
+                {
+                    'request_count': 0,
+                    'prompt_tokens': 0,
+                    'completion_tokens': 0,
+                    'total_tokens': 0,
+                    'cost_micros': 0,
+                    'unpriced_tokens': 0,
+                    'updated_at': 0,
+                },
+            )
+            current['request_count'] += _int_or_zero(row['request_count'])
+            current['prompt_tokens'] += prompt
+            current['completion_tokens'] += completion
+            current['total_tokens'] += total
+            current['cost_micros'] += cost
+            current['unpriced_tokens'] += unpriced
+            current['updated_at'] = max(current['updated_at'], _int_or_zero(row['updated_at']))
+
+        for user_id, totals in folded.items():
+            db.add(UserTokenUsage(user_id=user_id, **totals))
+
+    def add_tokens(self, *, user_id: str, model: Optional[str], usage: Optional[dict]) -> bool:
+        counts = _token_counts(usage)
+        if not user_id or counts is None:
+            return False
+        prompt, completion, total = counts
+        cost, unpriced = estimate_cost_micros(model, prompt, completion)
+        now = int(time.time())
+
+        self.ensure_table()
+        with get_db() as db:
+            dialect = db.bind.dialect.name
+            if dialect in ('postgresql', 'sqlite'):
+                insert = pg_insert if dialect == 'postgresql' else sqlite_insert
+                stmt = insert(UserTokenUsage).values(
+                    user_id=user_id,
+                    request_count=1,
+                    prompt_tokens=prompt,
+                    completion_tokens=completion,
+                    total_tokens=total,
+                    cost_micros=cost,
+                    unpriced_tokens=unpriced,
+                    updated_at=now,
+                )
+                excluded = stmt.excluded
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=['user_id'],
+                    set_={
+                        'request_count': UserTokenUsage.request_count + excluded.request_count,
+                        'prompt_tokens': UserTokenUsage.prompt_tokens + excluded.prompt_tokens,
+                        'completion_tokens': UserTokenUsage.completion_tokens + excluded.completion_tokens,
+                        'total_tokens': UserTokenUsage.total_tokens + excluded.total_tokens,
+                        'cost_micros': UserTokenUsage.cost_micros + excluded.cost_micros,
+                        'unpriced_tokens': UserTokenUsage.unpriced_tokens + excluded.unpriced_tokens,
+                        'updated_at': excluded.updated_at,
+                    },
+                )
+                db.execute(stmt)
+            else:
+                row = db.query(UserTokenUsage).filter_by(user_id=user_id).one_or_none()
+                if row is None:
+                    db.add(
+                        UserTokenUsage(
+                            user_id=user_id,
+                            request_count=1,
+                            prompt_tokens=prompt,
+                            completion_tokens=completion,
+                            total_tokens=total,
+                            cost_micros=cost,
+                            unpriced_tokens=unpriced,
+                            updated_at=now,
+                        )
+                    )
+                else:
+                    row.request_count = _int_or_zero(row.request_count) + 1
+                    row.prompt_tokens = _int_or_zero(row.prompt_tokens) + prompt
+                    row.completion_tokens = _int_or_zero(row.completion_tokens) + completion
+                    row.total_tokens = _int_or_zero(row.total_tokens) + total
+                    row.cost_micros = _int_or_zero(row.cost_micros) + cost
+                    row.unpriced_tokens = _int_or_zero(row.unpriced_tokens) + unpriced
+                    row.updated_at = now
             db.commit()
-            return UsageModel.model_validate(row)
+        return True
 
-    def get_logs(
-        self,
-        *,
-        user_id: Optional[str] = None,
-        user_email: Optional[str] = None,
-        provider: Optional[str] = None,
-        start_ts: Optional[int] = None,
-        end_ts: Optional[int] = None,
-        skip: Optional[int] = None,
-        limit: Optional[int] = None,
-    ) -> dict:
+    def list_totals(self) -> list[UserTokenTotal]:
         self.ensure_table()
         with get_db() as db:
-            query = db.query(Usage)
-
-            conditions = []
-            if user_id:
-                conditions.append(Usage.user_id == user_id.strip())
-            if user_email:
-                query = query.join(User, User.id == Usage.user_id)
-                conditions.append(User.email == user_email.strip())
-            if provider:
-                conditions.append(Usage.provider == provider)
-            if start_ts is not None:
-                conditions.append(Usage.created_at >= start_ts)
-            if end_ts is not None:
-                conditions.append(Usage.created_at <= end_ts)
-
-            if conditions:
-                query = query.filter(and_(*conditions))
-
-            # Count BEFORE pagination
-            total = query.count()
-
-            # Order BEFORE pagination to avoid SQLAlchemy error
-            query = query.order_by(Usage.created_at.desc(), Usage.id.desc())
-
-            if skip is not None:
-                query = query.offset(skip)
-            if limit is not None:
-                query = query.limit(limit)
-
-            logs = query.all()
-            return {
-                "logs": [UsageModel.model_validate(row) for row in logs],
-                "total": total,
-            }
-
-    def get_summary_by_user(
-        self,
-        *,
-        start_ts: Optional[int] = None,
-        end_ts: Optional[int] = None,
-    ) -> List[UsageSummaryByUser]:
-        self.ensure_table()
-        with get_db() as db:
-            query = (
+            rows = (
                 db.query(
-                    Usage.user_id.label("user_id"),
-                    User.email.label("user_email"),
-                    func.count(Usage.id).label("request_count"),
-                    func.coalesce(func.sum(Usage.total_tokens), 0).label("total_tokens"),
+                    UserTokenUsage,
+                    User.email.label('user_email'),
+                    User.name.label('user_name'),
                 )
-                .outerjoin(User, User.id == Usage.user_id)
+                .outerjoin(User, User.id == UserTokenUsage.user_id)
+                .order_by(UserTokenUsage.total_tokens.desc(), UserTokenUsage.user_id.asc())
+                .all()
             )
-
-            conditions = []
-            if start_ts is not None:
-                conditions.append(Usage.created_at >= start_ts)
-            if end_ts is not None:
-                conditions.append(Usage.created_at <= end_ts)
-
-            if conditions:
-                query = query.filter(and_(*conditions))
-
-            query = query.group_by(Usage.user_id, User.email).order_by(
-                func.count(Usage.id).desc()
-            )
-            rows = query.all()
-
             return [
-                UsageSummaryByUser(
-                    user_id=row.user_id,
-                    user_email=row.user_email,
-                    request_count=int(row.request_count or 0),
-                    total_tokens=int(row.total_tokens or 0),
+                UserTokenTotal(
+                    user_id=usage.user_id,
+                    user_email=email,
+                    user_name=name,
+                    request_count=_int_or_zero(usage.request_count),
+                    prompt_tokens=_int_or_zero(usage.prompt_tokens),
+                    completion_tokens=_int_or_zero(usage.completion_tokens),
+                    total_tokens=_int_or_zero(usage.total_tokens),
+                    cost_micros=_int_or_zero(usage.cost_micros),
+                    unpriced_tokens=_int_or_zero(usage.unpriced_tokens),
+                    updated_at=_int_or_zero(usage.updated_at),
                 )
-                for row in rows
+                for usage, email, name in rows
             ]
 
 
-Usages = UsagesTable()
-
-
+Usages = UserTokenUsages()

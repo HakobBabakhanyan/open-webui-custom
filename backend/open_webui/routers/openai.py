@@ -5,7 +5,6 @@ import hashlib
 import logging
 import re
 from typing import Optional
-from uuid import uuid4
 from urllib.parse import quote, urlparse
 
 import aiofiles
@@ -1642,55 +1641,26 @@ async def generate_chat_completion(
                     )
 
             streaming = True
-
-            usage_id = f"usage_{uuid4()}"
-            provider = "openai"
-            endpoint = "chat.completions"
-            model_name = form_data.get("model")
+            model_name = form_data.get('model')
 
             async def relay_and_log_usage():
                 usage_recorded = False
                 async for chunk in stream_chunks_handler(r.content):
-                    # Attempt to parse usage from SSE lines: "data: { ... }"
-                    try:
-                        if chunk.startswith(b"data:"):
-                            payload = chunk[5:].strip()
-                            if payload and payload != b"[DONE]":
-                                obj = json.loads(payload.decode("utf-8"))
-                                usage = obj.get("usage")
-                                if isinstance(usage, dict) and not usage_recorded:
-                                    # Persist usage once when we see it
-                                    Usages.add_usage(
-                                        id=usage_id,
-                                        user_id=user.id,
-                                        provider=provider,
-                                        model=model_name,
-                                        endpoint=endpoint,
-                                        request_id=obj.get("id")
-                                        if isinstance(obj.get("id"), str)
-                                        else None,
-                                        usage=usage,
-                                        extra={"stream": True},
-                                    )
-                                    usage_recorded = True
-                    except Exception:
-                        # Ignore parsing errors; just forward the chunk
-                        pass
+                    if not usage_recorded:
+                        try:
+                            if chunk.startswith(b'data:'):
+                                payload = chunk[5:].strip()
+                                if payload and payload != b'[DONE]':
+                                    obj = json.loads(payload.decode('utf-8'))
+                                    usage = obj.get('usage')
+                                    if isinstance(usage, dict) and Usages.add_tokens(
+                                        user_id=user.id, model=model_name, usage=usage
+                                    ):
+                                        usage_recorded = True
+                        except Exception:
+                            pass
 
                     yield chunk
-
-                # If stream finished without usage info, persist at least a request record
-                if not usage_recorded:
-                    Usages.add_usage(
-                        id=usage_id,
-                        user_id=user.id,
-                        provider=provider,
-                        model=model_name,
-                        endpoint=endpoint,
-                        request_id=None,
-                        usage=None,
-                        extra={"stream": True, "note": "no usage in stream"},
-                    )
 
             return StreamingResponse(
                 relay_and_log_usage(),
@@ -1721,24 +1691,15 @@ async def generate_chat_completion(
                 else:
                     return PlainTextResponse(status_code=r.status, content=response, headers=retry_headers)
 
-            # Log usage for non-streaming responses (if available)
             try:
                 if isinstance(response, dict):
-                    usage = response.get("usage")
-                    Usages.add_usage(
-                        id=f"usage_{uuid4()}",
+                    Usages.add_tokens(
                         user_id=user.id,
-                        provider="openai",
-                        model=form_data.get("model"),
-                        endpoint="chat.completions",
-                        request_id=response.get("id")
-                        if isinstance(response.get("id"), str)
-                        else None,
-                        usage=usage if isinstance(usage, dict) else None,
-                        extra={"stream": False},
+                        model=form_data.get('model'),
+                        usage=response.get('usage'),
                     )
             except Exception:
-                pass
+                log.exception('Failed to record chat token usage')
 
             # Convert Responses API result to simple format
             if is_responses and isinstance(response, dict):
@@ -1852,24 +1813,15 @@ async def embeddings(request: Request, form_data: dict, user):
                 else:
                     return PlainTextResponse(status_code=r.status, content=response_data, headers=retry_headers)
 
-            # Log usage for embeddings if usage is included
             try:
                 if isinstance(response_data, dict):
-                    usage = response_data.get("usage")
-                    Usages.add_usage(
-                        id=f"usage_{uuid4()}",
+                    Usages.add_tokens(
                         user_id=user.id,
-                        provider="openai",
-                        model=form_data.get("model"),
-                        endpoint="embeddings",
-                        request_id=response_data.get("id")
-                        if isinstance(response_data.get("id"), str)
-                        else None,
-                        usage=usage if isinstance(usage, dict) else None,
-                        extra={"stream": False},
+                        model=form_data.get('model'),
+                        usage=response_data.get('usage'),
                     )
             except Exception:
-                pass
+                log.exception('Failed to record embedding token usage')
 
             return response_data
     except Exception as e:
