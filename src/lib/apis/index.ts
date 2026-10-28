@@ -1484,8 +1484,21 @@ export type AdminUsageUser = {
 	updated_at: number;
 };
 
+export type AdminUsageModel = {
+	user_id: string;
+	model: string;
+	request_count: number;
+	prompt_tokens: number;
+	completion_tokens: number;
+	total_tokens: number;
+	cost_micros: number;
+	unpriced_tokens: number;
+	updated_at: number;
+};
+
 export type AdminUsageSummary = {
 	users: AdminUsageUser[];
+	models: AdminUsageModel[];
 	totals: {
 		users: number;
 		request_count: number;

@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from open_webui.models.usage import Usages, UserTokenTotal
+from open_webui.models.usage import Usages, UserModelTotal, UserTokenTotal
 from open_webui.utils.auth import get_admin_user
 
 
@@ -25,6 +25,7 @@ class UsageTotals(BaseModel):
 
 class UsageSummaryResponse(BaseModel):
     users: list[UserTokenTotal]
+    models: list[UserModelTotal]
     totals: UsageTotals
 
 
@@ -32,8 +33,10 @@ class UsageSummaryResponse(BaseModel):
 async def get_usage_summary(user=Depends(get_admin_user)):
     try:
         rows = Usages.list_totals()
+        models = Usages.list_model_totals()
         return {
             'users': rows,
+            'models': models,
             'totals': {
                 'users': len(rows),
                 'request_count': sum(row.request_count for row in rows),
