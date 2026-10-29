@@ -28,8 +28,18 @@ _MODEL_RATES: dict[str, tuple[float, float]] = {
     'text-embedding-3-small': (0.02, 0.0),
     'text-embedding-3-large': (0.13, 0.0),
     'text-embedding-ada-002': (0.10, 0.0),
+    'chatgpt-4o-latest': (5.00, 15.00),
+    'claude-opus-5-5': (4.00, 20.00),
+    'claude-opus-5': (5.00, 25.00),
+    'claude-opus-4-8': (5.00, 25.00),
+    'claude-opus-4-7': (5.00, 25.00),
+    'claude-opus-4-6': (5.00, 25.00),
+    'claude-opus-4-5': (5.00, 25.00),
     'claude-opus-4-1': (15.00, 75.00),
     'claude-opus-4': (15.00, 75.00),
+    'claude-sonnet-5-5': (2.00, 10.00),
+    'claude-sonnet-5': (2.00, 10.00),
+    'claude-sonnet-4-6': (3.00, 15.00),
     'claude-sonnet-4-5': (3.00, 15.00),
     'claude-sonnet-4': (3.00, 15.00),
     'claude-haiku-4-5': (1.00, 5.00),
@@ -39,6 +49,7 @@ _MODEL_RATES: dict[str, tuple[float, float]] = {
     'claude-3-opus': (15.00, 75.00),
     'claude-3-haiku': (0.25, 1.25),
     'claude-3-sonnet': (3.00, 15.00),
+    'gemini-3.1-pro': (2.00, 12.00),
     'gemini-2.5-flash-lite': (0.10, 0.40),
     'gemini-2.5-flash': (0.30, 2.50),
     'gemini-2.5-pro': (1.25, 10.00),
@@ -170,10 +181,42 @@ class UserTokenUsages:
             UserModelUsage.__table__.create(bind=db.bind, checkfirst=True)
             need_users = db.query(UserTokenUsage.user_id).first() is None
             need_models = db.query(UserModelUsage.user_id).first() is None
+            changed = False
             if need_users or need_models:
                 self._rollup_legacy_logs(db, users=need_users, models=need_models)
+                changed = True
+            if self._reprice_stored_totals(db):
+                changed = True
+            if changed:
                 db.commit()
         self._ready = True
+
+    def _reprice_stored_totals(self, db) -> bool:
+        """Recompute stored estimates from token counts and the current rate table."""
+        changed = False
+        cost_by_user: dict[str, int] = {}
+        unpriced_by_user: dict[str, int] = {}
+        for row in db.query(UserModelUsage).all():
+            cost, unpriced = estimate_cost_micros(
+                row.model, _int_or_zero(row.prompt_tokens), _int_or_zero(row.completion_tokens)
+            )
+            cost_by_user[row.user_id] = cost_by_user.get(row.user_id, 0) + cost
+            unpriced_by_user[row.user_id] = unpriced_by_user.get(row.user_id, 0) + unpriced
+            if _int_or_zero(row.cost_micros) != cost or _int_or_zero(row.unpriced_tokens) != unpriced:
+                row.cost_micros = cost
+                row.unpriced_tokens = unpriced
+                changed = True
+
+        for row in db.query(UserTokenUsage).all():
+            if row.user_id not in cost_by_user:
+                continue
+            cost = cost_by_user[row.user_id]
+            unpriced = unpriced_by_user.get(row.user_id, 0)
+            if _int_or_zero(row.cost_micros) != cost or _int_or_zero(row.unpriced_tokens) != unpriced:
+                row.cost_micros = cost
+                row.unpriced_tokens = unpriced
+                changed = True
+        return changed
 
     def _rollup_legacy_logs(self, db, *, users: bool, models: bool):
         if not inspect(db.bind).has_table('usage_log'):
