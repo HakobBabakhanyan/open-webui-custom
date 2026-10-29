@@ -1489,6 +1489,8 @@ export type AdminUsageUser = {
 export type AdminUsageModel = {
 	user_id: string;
 	model: string;
+	model_name?: string | null;
+	base_model_id?: string | null;
 	request_count: number;
 	prompt_tokens: number;
 	completion_tokens: number;

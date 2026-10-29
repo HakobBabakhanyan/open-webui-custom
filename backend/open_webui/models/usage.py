@@ -7,6 +7,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from open_webui.internal.db import Base, get_db
+from open_webui.models.models import Model
 from open_webui.models.users import User
 
 
@@ -107,6 +108,8 @@ class UserTokenTotal(BaseModel):
 class UserModelTotal(BaseModel):
     user_id: str
     model: str
+    model_name: Optional[str] = None
+    base_model_id: Optional[str] = None
     request_count: int
     prompt_tokens: int
     completion_tokens: int
@@ -413,24 +416,46 @@ class UserTokenUsages:
                 for usage, email, name in rows
             ]
 
+    def _workspace_model_index(self, db) -> dict[str, tuple[Optional[str], Optional[str]]]:
+        """Map a stored usage model key to (display name, base model id)."""
+        if not inspect(db.bind).has_table('model'):
+            return {}
+
+        index: dict[str, tuple[Optional[str], Optional[str]]] = {}
+        for model_id, name, base_model_id in db.query(Model.id, Model.name, Model.base_model_id).all():
+            label = (name or '').strip() or None
+            base = (base_model_id or '').strip() or None
+            if base and _model_key(base) == _model_key(model_id):
+                base = None
+            for key in {_model_key(model_id), (model_id or '').strip().lower()}:
+                if key:
+                    index[key] = (label, base)
+        return index
+
     def list_model_totals(self) -> list[UserModelTotal]:
         self.ensure_table()
         with get_db() as db:
+            workspace = self._workspace_model_index(db)
             rows = db.query(UserModelUsage).order_by(UserModelUsage.total_tokens.desc(), UserModelUsage.model.asc()).all()
-            return [
-                UserModelTotal(
-                    user_id=row.user_id,
-                    model=row.model,
-                    request_count=_int_or_zero(row.request_count),
-                    prompt_tokens=_int_or_zero(row.prompt_tokens),
-                    completion_tokens=_int_or_zero(row.completion_tokens),
-                    total_tokens=_int_or_zero(row.total_tokens),
-                    cost_micros=_int_or_zero(row.cost_micros),
-                    unpriced_tokens=_int_or_zero(row.unpriced_tokens),
-                    updated_at=_int_or_zero(row.updated_at),
+            totals = []
+            for row in rows:
+                model_name, base_model_id = workspace.get(row.model, (None, None))
+                totals.append(
+                    UserModelTotal(
+                        user_id=row.user_id,
+                        model=row.model,
+                        model_name=model_name if model_name and model_name.lower() != row.model else None,
+                        base_model_id=base_model_id,
+                        request_count=_int_or_zero(row.request_count),
+                        prompt_tokens=_int_or_zero(row.prompt_tokens),
+                        completion_tokens=_int_or_zero(row.completion_tokens),
+                        total_tokens=_int_or_zero(row.total_tokens),
+                        cost_micros=_int_or_zero(row.cost_micros),
+                        unpriced_tokens=_int_or_zero(row.unpriced_tokens),
+                        updated_at=_int_or_zero(row.updated_at),
+                    )
                 )
-                for row in rows
-            ]
+            return totals
 
 
 Usages = UserTokenUsages()
